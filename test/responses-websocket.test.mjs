@@ -229,7 +229,7 @@ function createRequest(overrides = {}) {
 test("Codex interrupt stops the active response and reuses its completed items on the same socket", async (t) => {
   const bodies = [];
   let canceled = false;
-  const kept = { id: "kept", type: "message", role: "assistant", content: [{ type: "output_text", text: "finished" }] };
+  const kept = { id: "kept", type: "function_call", call_id: "completed-call", name: "read_fixture", arguments: "{}" };
   const { server, port } = await startServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -275,13 +275,16 @@ test("Codex interrupt stops the active response and reuses its completed items o
   assert.equal(terminal.sequence_number, 5);
   await waitFor(() => canceled);
   const nextInput = { type: "message", role: "user", content: "change direction" };
+  const toolResult = { type: "function_call_output", call_id: "completed-call", output: "already executed" };
   // A late duplicate control cannot leave a 400 waiting for the next turn.
   peer.sendJson({ type: "response.interrupt", response_id: "active", mode: "discard_partial_items" });
-  peer.sendJson(createRequest({ previous_response_id: "active", input: [nextInput] }));
+  peer.sendJson(createRequest({ previous_response_id: "active", input: [toolResult, nextInput] }));
   assert.equal((await peer.nextJson()).type, "response.created");
   assert.equal((await peer.nextJson()).type, "response.completed");
   assert.equal(bodies.length, 2);
-  assert.deepEqual(bodies[1].input, [...createRequest().input, kept, nextInput]);
+  assert.deepEqual(bodies[1].input, [...createRequest().input, kept, toolResult, nextInput]);
+  assert.equal(bodies[1].input.filter((item) => item.type === "function_call").length, 1);
+  assert.equal(bodies[1].input.filter((item) => item.type === "function_call_output").length, 1);
 });
 
 test("an interrupted output keeps completed items beyond the continuation cache and requires full-context recovery", async (t) => {
@@ -339,6 +342,12 @@ test("completion wins a late interrupt without poisoning the next WebSocket gene
   assert.equal((await peer.nextJson()).type, "response.created");
   assert.equal((await peer.nextJson()).type, "response.completed");
   assert.equal(calls, 2);
+  // A delayed duplicate for A must not poison C after B has completed.
+  peer.sendJson({ type: "response.interrupt", response_id: "completed-1", mode: "discard_partial_items" });
+  peer.sendJson(createRequest({ previous_response_id: "completed-2" }));
+  assert.equal((await peer.nextJson()).type, "response.created");
+  assert.equal((await peer.nextJson()).type, "response.completed");
+  assert.equal(calls, 3);
 });
 
 test("interrupt during completed-JSON write backpressure retains observed usage and completed output", async (t) => {

@@ -82,6 +82,8 @@ const PER_REQUEST_IDENTITY_HEADERS = new Set([
 ]);
 const MAX_QUEUED_REQUESTS = 2;
 const MAX_INTERRUPT_PENDING_ITEMS = 256;
+const MAX_RECENT_RESPONSE_IDS = 16;
+const MAX_RECENT_RESPONSE_ID_BYTES = 256;
 const MAX_TURN_METADATA_HEADER_BYTES = 8 * 1_024;
 const MAX_RATE_LIMIT_FAMILIES = 16;
 const MAX_RATE_LIMIT_FAMILY_CANDIDATES = 64;
@@ -686,7 +688,7 @@ class ResponsesWebSocketPeer {
     this.continuations = new Map();
     this.turnState = undefined;
     this.activeResponse = undefined;
-    this.lastResponseId = undefined;
+    this.recentResponseIds = new Set();
     // The peer is the server side, so it parses masked client frames and
     // answers pings itself; the shared codec owns every frame-level rule.
     this.parser = new WebSocketFrameParser({
@@ -734,6 +736,7 @@ class ResponsesWebSocketPeer {
     this.parser.stop();
     this.abortController.abort(new Error("Responses WebSocket closed."));
     this.continuations.clear();
+    this.recentResponseIds.clear();
     // The upgraded socket came from http.Server, which allows half-open
     // connections, so a peer that goes away without a close frame ends only
     // the readable side. Nothing else closes the writable side, and Node keeps
@@ -861,7 +864,7 @@ class ResponsesWebSocketPeer {
     const active = this.activeResponse;
     // Completion can win the race with a client's interrupt frame. Its
     // terminal event already settles the turn; do not poison socket reuse.
-    if (request.response_id === this.lastResponseId && active?.id !== request.response_id) return;
+    if (this.recentResponseIds.has(request.response_id) && active?.id !== request.response_id) return;
     if (!active || active.id !== request.response_id) {
       this.sendError(400, {
         type: "invalid_request_error",
@@ -905,12 +908,21 @@ class ResponsesWebSocketPeer {
     }
     active.terminalSent = true;
     if (!(await this.sendJsonWithBackpressure(terminal))) return;
-    this.lastResponseId = active.id;
+    this.rememberResponseId(active.id);
     this.continuations.clear();
     const continuation = continuationState(
       active.input, active.completedItems, this.options.maxContinuationBytes,
     );
     if (continuation && !active.continuationOverflow) this.continuations.set(active.id, continuation);
+  }
+
+  rememberResponseId(id) {
+    if (typeof id !== "string" || Buffer.byteLength(id, "utf8") > MAX_RECENT_RESPONSE_ID_BYTES) return;
+    this.recentResponseIds.delete(id);
+    this.recentResponseIds.add(id);
+    if (this.recentResponseIds.size > MAX_RECENT_RESPONSE_IDS) {
+      this.recentResponseIds.delete(this.recentResponseIds.values().next().value);
+    }
   }
 
   async process(request) {
@@ -988,7 +1000,7 @@ class ResponsesWebSocketPeer {
 
     if (request.generate === false) {
       const responseId = `resp_router_prewarm_${randomUUID().replaceAll("-", "")}`;
-      this.lastResponseId = responseId;
+      this.rememberResponseId(responseId);
       this.continuations.clear();
       const continuation = continuationState(fullRequest.input, [], this.options.maxContinuationBytes);
       if (continuation) this.continuations.set(responseId, continuation);
@@ -1120,7 +1132,7 @@ class ResponsesWebSocketPeer {
           type: "response.completed",
           response: completedResponse,
         }))) return;
-        this.lastResponseId = completedResponse.id;
+        this.rememberResponseId(completedResponse.id);
         this.continuations.clear();
         const continuation = continuationState(
           fullRequest.input,
@@ -1189,7 +1201,7 @@ class ResponsesWebSocketPeer {
           }
           if (["response.completed", "response.failed", "response.incomplete", "error"].includes(event.type)) {
             active.terminalSent = true;
-            if (active.id) this.lastResponseId = active.id;
+            if (active.id) this.rememberResponseId(active.id);
           }
           if (event.type === "response.output_item.done" && event.item) {
             const itemBytes = Buffer.byteLength(JSON.stringify(event.item), "utf8");
